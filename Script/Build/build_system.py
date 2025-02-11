@@ -5,22 +5,27 @@ import argparse
 from pathlib import Path
 from third_party_config import THIRD_PARTY_LIBS, ENABLED_LIBS, SUBMODULES
 from typing import Optional
+import importlib.util
+import sys
 
 class BuildSystem:
     def __init__(self):
         self.project_root = Path(__file__).parent.parent.parent
         self.compiler = self.detect_compiler()
-        self.build_dir = self.project_root / "build"
-        self.bin_dir = self.build_dir / "bin"
-        self.obj_dir = self.build_dir / "obj"
+        self.build_dir = self.project_root / "Build"
+        self.bin_dir = self.build_dir / "Binary"
+        self.obj_dir = self.build_dir / "Object"
+        self.lib_dir = self.build_dir / "Library"
         self.system = platform.system().lower()
         self.third_party_dir = self.project_root / "Engine" / "ThirdParty"
+        self.built_projects = set()  # 记录已构建的项目
 
     def detect_compiler(self):
-        system = platform.system()
-        if system == "Windows":
+        if platform.system() == "Windows":
+            # TODO: 检测是否安装了MSVC
             return "msvc"
         else:
+            # TODO: 检测是否安装了GCC
             return "gcc"
 
     def get_third_party_flags(self):
@@ -59,75 +64,166 @@ class BuildSystem:
 
         return include_flags, lib_dir_flags, lib_flags
 
-    def get_compile_command(self, source_file, output_file):
-        include_flags, _, _ = self.get_third_party_flags()
-        include_flags_str = " ".join(include_flags)
-        
+    def get_compile_command(self, source, obj_file, config):
+        """生成编译命令"""
+        cmd = []
         if self.compiler == "msvc":
-            return f"cl /nologo /EHsc /W4 /std:c++17 {include_flags_str} /c {source_file} /Fo{output_file}"
+            cmd = ["cl", "/c", "/nologo", "/EHsc"]
+            cmd.extend(config.COMPILE_OPTIONS["msvc"])
+            for inc in config.INCLUDE_DIRS:
+                cmd.append(f"/I{self.project_root / inc}")
+            for define in config.DEFINITIONS:
+                cmd.append(f"/D{define}")
+            cmd.extend([str(source), f"/Fo{obj_file}"])
         else:
-            return f"g++ -c -std=c++17 -Wall -Wextra {include_flags_str} {source_file} -o {output_file}"
+            cmd = ["g++", "-c"]
+            cmd.extend(config.COMPILE_OPTIONS["gcc"])
+            for inc in config.INCLUDE_DIRS:
+                cmd.append(f"-I{self.project_root / inc}")
+            for define in config.DEFINITIONS:
+                cmd.append(f"-D{define}")
+            cmd.extend([str(source), "-o", str(obj_file)])
+        return cmd
 
-    def get_link_command(self, obj_files, output_file):
-        _, lib_dir_flags, lib_flags = self.get_third_party_flags()
-        lib_dir_flags_str = " ".join(lib_dir_flags)
-        lib_flags_str = " ".join(lib_flags)
-        obj_files_str = " ".join(str(f) for f in obj_files)
-        
+    def get_link_command(self, obj_files, output_file, config):
+        """生成链接命令"""
+        cmd = []
         if self.compiler == "msvc":
-            return f"link /nologo {obj_files_str} {lib_dir_flags_str} {lib_flags_str} /out:{output_file}"
+            cmd = ["link", "/nologo"]
+            cmd.extend(config.LINK_OPTIONS["msvc"])
+            cmd.extend([str(obj) for obj in obj_files])
+            cmd.extend([f"/OUT:{output_file}"])
         else:
-            return f"g++ {obj_files_str} {lib_dir_flags_str} {lib_flags_str} -o {output_file}"
+            cmd = ["g++"]
+            cmd.extend(config.LINK_OPTIONS["gcc"])
+            cmd.extend([str(obj) for obj in obj_files])
+            cmd.extend(["-o", str(output_file)])
+        return cmd
 
     def prepare_directories(self):
+        """准备构建目录"""
         self.build_dir.mkdir(exist_ok=True)
         self.bin_dir.mkdir(exist_ok=True)
         self.obj_dir.mkdir(exist_ok=True)
+        self.lib_dir.mkdir(exist_ok=True)
 
-    def build(self, target=None):
-        self.prepare_directories()
-        
-        # 编译Engine
-        engine_sources = self.collect_sources("Engine")
-        engine_objects = self.compile_sources(engine_sources)
+    def load_build_config(self, project_path):
+        """加载项目构建配置"""
+        try:
+            # 使用新的命名格式：{ProjectName}.Build.py
+            project_name = project_path.name
+            config_path = project_path / f"{project_name}.Build.py"
+            
+            if not config_path.exists():
+                print(f"Build config not found: {config_path}")
+                return None
+                
+            spec = importlib.util.spec_from_file_location("build_config", config_path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+        except Exception as e:
+            print(f"Error loading build config {config_path}: {e}")
+            return None
 
-        # 编译Project
-        project_sources = self.collect_sources("Project")
-        project_objects = self.compile_sources(project_sources)
+    def build_project(self, project_path):
+        """构建单个项目"""
+        if project_path in self.built_projects:
+            return True
 
-        # 链接最终可执行文件
-        all_objects = engine_objects + project_objects
-        self._link_executable(all_objects)
+        # 加载项目配置
+        config = self.load_build_config(project_path)
+        if not config:
+            return False
 
-    def collect_sources(self, directory):
+        # 首先构建依赖项
+        for dep in config.DEPENDENCIES:
+            dep_path = self.resolve_dependency_path(dep)
+            if not self.build_project(dep_path):
+                return False
+
+        print(f"\nBuilding {config.PROJECT['name']}...")
+
+        # 收集源文件
         sources = []
-        for root, _, files in os.walk(self.project_root / directory):
-            for file in files:
-                if file.endswith(('.cpp', '.cc', '.cxx')):
-                    sources.append(Path(root) / file)
-        return sources
+        for src_dir in config.SOURCE_DIRS:
+            src_path = project_path / src_dir
+            sources.extend(self.collect_sources(src_path))
 
-    def compile_sources(self, sources):
+        # 编译源文件
         obj_files = []
         for source in sources:
             rel_path = source.relative_to(self.project_root)
             obj_file = self.obj_dir / f"{rel_path.stem}.obj"
             obj_file.parent.mkdir(parents=True, exist_ok=True)
-            
-            cmd = self.get_compile_command(source, obj_file)
-            print(f"Compiling: {source}")
-            subprocess.run(cmd, shell=True, check=True)
-            obj_files.append(obj_file)
-        return obj_files
 
-    def _link_executable(self, obj_files):
-        executable = self.bin_dir / "GameServer"
-        if platform.system() == "Windows":
-            executable = executable.with_suffix(".exe")
+            cmd = self.get_compile_command(source, obj_file, config)
+            print(f"Compiling: {source}")
+            try:
+                subprocess.run(cmd, check=True)
+                obj_files.append(obj_file)
+            except subprocess.CalledProcessError as e:
+                print(f"Compilation failed: {e}")
+                return False
+
+        # 链接
+        if config.PROJECT["type"] == "executable":
+            output_file = self.bin_dir / config.PROJECT["name"]
+            if platform.system() == "Windows":
+                output_file = output_file.with_suffix(".exe")
+        else:
+            output_file = self.lib_dir / f"{config.PROJECT['name']}.lib"
+
+        cmd = self.get_link_command(obj_files, output_file, config)
+        print(f"Linking: {output_file}")
+        try:
+            subprocess.run(cmd, check=True)
+        except subprocess.CalledProcessError as e:
+            print(f"Linking failed: {e}")
+            return False
+
+        self.built_projects.add(project_path)
+        return True
+
+    def resolve_dependency_path(self, dep):
+        """解析依赖项路径"""
+        parts = dep.split('.')
+        if parts[0] == "Engine":
+            return self.project_root / "Engine" / '/'.join(parts[1:])
+        else:
+            return self.project_root / "Project" / parts[-1]
+
+    def collect_sources(self, directory):
+        """收集源文件"""
+        sources = []
+        for root, _, files in os.walk(directory):
+            for file in files:
+                if file.endswith(('.cpp', '.cc', '.cxx')):
+                    sources.append(Path(root) / file)
+        return sources
+
+    def build_all(self):
+        """构建所有项目"""
+        self.prepare_directories()
         
-        cmd = self.get_link_command(obj_files, executable)
-        print(f"Linking: {executable}")
-        subprocess.run(cmd, shell=True, check=True)
+        # 构建Engine核心
+        engine_core = self.project_root / "Engine/Core"
+        if not self.build_project(engine_core):
+            return False
+
+        # 构建GamePlay模块
+        gameplay = self.project_root / "Engine/GamePlay"
+        if not self.build_project(gameplay):
+            return False
+
+        # 构建Project下的所有项目
+        project_dir = self.project_root / "Project"
+        for project_dir in project_dir.iterdir():
+            if project_dir.is_dir() and (project_dir / f"{project_dir.name}.Build.py").exists():
+                if not self.build_project(project_dir):
+                    return False
+
+        return True
 
     def init_submodules(self):
         """初始化所有git submodules"""
@@ -231,7 +327,11 @@ def main():
         return
 
     builder.validate_third_party_libs()  # 在构建前验证库
-    builder.build(args.target)
+    if builder.build_all():
+        print("\nBuild completed successfully!")
+    else:
+        print("\nBuild failed!")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main() 

@@ -7,6 +7,12 @@ from third_party_config import THIRD_PARTY_LIBS, ENABLED_LIBS, SUBMODULES
 from typing import Optional
 import importlib.util
 import sys
+import locale
+import codecs
+
+# 设置控制台编码
+if platform.system() == "Windows":
+    locale.setlocale(locale.LC_ALL, 'en_US.UTF-8')
 
 class BuildSystem:
     def __init__(self):
@@ -20,13 +26,77 @@ class BuildSystem:
         self.third_party_dir = self.project_root / "Engine" / "ThirdParty"
         self.built_projects = set()  # 记录已构建的项目
 
+    def detect_vs_path(self):
+        """自动检测 Visual Studio 安装路径"""
+        possible_paths = [
+            r"C:\Program Files\Microsoft Visual Studio",
+            r"C:\Program Files (x86)\Microsoft Visual Studio"
+        ]
+        versions = ["2022", "2019", "2017"]
+        editions = ["Enterprise", "Professional", "Community"]
+        
+        for base_path in possible_paths:
+            if os.path.exists(base_path):
+                for version in versions:
+                    for edition in editions:
+                        vs_path = os.path.join(base_path, version, edition)
+                        vcvars_path = os.path.join(vs_path, "VC\\Auxiliary\\Build\\vcvars64.bat")
+                        if os.path.exists(vcvars_path):
+                            return vcvars_path
+        return None
+
     def detect_compiler(self):
+        """检测并配置编译器"""
         if platform.system() == "Windows":
-            # TODO: 检测是否安装了MSVC
+            # 尝试查找 MSVC
+            vcvars_path = self.detect_vs_path()
+            if vcvars_path:
+                try:
+                    # 运行 vcvars64.bat 并获取环境变量
+                    process = subprocess.Popen(f'"{vcvars_path}" && set', 
+                                            stdout=subprocess.PIPE, 
+                                            stderr=subprocess.PIPE,
+                                            shell=True)
+                    for line in process.stdout:
+                        try:
+                            line = line.decode('utf-8').strip()
+                            if '=' in line:
+                                key, value = line.split('=', 1)
+                                os.environ[key] = value
+                        except UnicodeDecodeError:
+                            continue
+                    return "msvc"
+                except Exception as e:
+                    print(f"Warning: Failed to configure MSVC: {e}")
+            
+            # 如果找不到 MSVC 或配置失败，检查是否有 gcc
+            try:
+                subprocess.run(['gcc', '--version'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                return "gcc"
+            except FileNotFoundError:
+                pass
+            
+            # 检查是否有 clang
+            try:
+                subprocess.run(['clang', '--version'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                return "clang"
+            except FileNotFoundError:
+                pass
+            
+            print("Warning: No supported compiler found. Defaulting to MSVC configuration.")
             return "msvc"
         else:
-            # TODO: 检测是否安装了GCC
-            return "gcc"
+            # 在非 Windows 系统上优先使用 gcc，其次是 clang
+            try:
+                subprocess.run(['gcc', '--version'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                return "gcc"
+            except FileNotFoundError:
+                try:
+                    subprocess.run(['clang', '--version'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    return "clang"
+                except FileNotFoundError:
+                    print("Warning: No supported compiler found. Defaulting to GCC configuration.")
+                    return "gcc"
 
     def get_third_party_flags(self):
         include_flags = []
@@ -107,29 +177,41 @@ class BuildSystem:
         self.obj_dir.mkdir(exist_ok=True)
         self.lib_dir.mkdir(exist_ok=True)
 
-    def load_build_config(self, project_path):
-        """加载项目构建配置"""
-        try:
-            # 使用新的命名格式：{ProjectName}.Build.py
-            project_name = project_path.name
-            config_path = project_path / f"{project_name}.Build.py"
-            
-            if not config_path.exists():
-                print(f"Build config not found: {config_path}")
-                return None
-                
-            spec = importlib.util.spec_from_file_location("build_config", config_path)
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            return module
-        except Exception as e:
-            print(f"Error loading build config {config_path}: {e}")
-            return None
+    def find_build_config(self, project_path: Path) -> Optional[Path]:
+        """查找构建配置文件
+        1. 先查找当前目录的 Build.py
+        2. 如果没有，则查找父目录的 Build.py
+        """
+        # 检查当前目录
+        build_file = project_path / f"{project_path.name}.Build.py"
+        if build_file.exists():
+            return build_file
+        
+        # 检查是否有 Build.py
+        build_file = project_path / "Build.py"
+        if build_file.exists():
+            return build_file
+        
+        # 检查父目录
+        parent_build = project_path.parent / f"{project_path.parent.name}.Build.py"
+        if parent_build.exists():
+            return parent_build
+        
+        return None
 
-    def build_project(self, project_path):
-        """构建单个项目"""
+    def build_project(self, project_path: Path, built_deps=None) -> bool:
+        """构建项目"""
+        if built_deps is None:
+            built_deps = set()
+
         if project_path in self.built_projects:
             return True
+
+        # 查找构建配置文件
+        build_file = self.find_build_config(project_path)
+        if not build_file:
+            print(f"No build configuration found for {project_path}")
+            return False
 
         # 加载项目配置
         config = self.load_build_config(project_path)
@@ -139,7 +221,7 @@ class BuildSystem:
         # 首先构建依赖项
         for dep in config.DEPENDENCIES:
             dep_path = self.resolve_dependency_path(dep)
-            if not self.build_project(dep_path):
+            if not self.build_project(dep_path, built_deps):
                 return False
 
         print(f"\nBuilding {config.PROJECT['name']}...")
@@ -147,7 +229,12 @@ class BuildSystem:
         # 收集源文件
         sources = []
         for src_dir in config.SOURCE_DIRS:
-            src_path = project_path / src_dir
+            # 如果是相对路径且以 ".." 开头，基于构建文件所在目录解析
+            if src_dir.startswith(".."):
+                src_path = build_file.parent / src_dir
+            else:
+                # 否则基于项目路径解析
+                src_path = project_path / src_dir
             sources.extend(self.collect_sources(src_path))
 
         # 编译源文件
@@ -162,8 +249,8 @@ class BuildSystem:
             try:
                 subprocess.run(cmd, check=True)
                 obj_files.append(obj_file)
-            except subprocess.CalledProcessError as e:
-                print(f"Compilation failed: {e}")
+            except Exception as e:
+                print(f"Command {cmd} Run failed: {e}")
                 return False
 
         # 链接
@@ -189,7 +276,9 @@ class BuildSystem:
         """解析依赖项路径"""
         parts = dep.split('.')
         if parts[0] == "Engine":
-            return self.project_root / "Engine" / '/'.join(parts[1:])
+            # 对于引擎模块，只返回到主模块目录
+            # 例如 Engine.Core.Network -> Engine/Core
+            return self.project_root / "Engine" / parts[1]
         else:
             return self.project_root / "Project" / parts[-1]
 
@@ -201,6 +290,25 @@ class BuildSystem:
                 if file.endswith(('.cpp', '.cc', '.cxx')):
                     sources.append(Path(root) / file)
         return sources
+
+    def load_build_config(self, project_path):
+        """加载项目构建配置"""
+        try:
+            # 使用新的命名格式：{ProjectName}.Build.py
+            project_name = project_path.name
+            config_path = project_path / f"{project_name}.Build.py"
+            
+            if not config_path.exists():
+                print(f"Build config not found: {config_path}")
+                return None
+                
+            spec = importlib.util.spec_from_file_location("build_config", config_path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+        except Exception as e:
+            print(f"Error loading build config {config_path}: {e}")
+            return None
 
     def build_all(self):
         """构建所有项目"""

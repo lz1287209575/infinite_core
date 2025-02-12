@@ -8,12 +8,12 @@ PROJECT = {
     "version": "1.0.0",
 }
 
-# 源文件目录
+# 源文件目录（使用相对路径）
 SOURCE_DIRS = [
-    "Common",
-    "Network",
-    "Database",
-    "Server",
+    "./Common",    # Core/Common 目录
+    "./Network",   # Core/Network 目录
+    "./Database",  # Core/Database 目录
+    "./Server",    # Core/Server 目录
 ]
 
 # 包含目录

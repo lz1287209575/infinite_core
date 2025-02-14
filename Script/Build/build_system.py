@@ -140,16 +140,22 @@ class BuildSystem:
         if self.compiler == "msvc":
             cmd = ["cl", "/c", "/nologo", "/EHsc"]
             cmd.extend(config.COMPILE_OPTIONS["msvc"])
+            # 添加项目根目录作为包含路径
+            cmd.append(f"/I{self.project_root}")
             for inc in config.INCLUDE_DIRS:
-                cmd.append(f"/I{self.project_root / inc}")
+                inc_path = self.project_root / inc
+                cmd.append(f"/I{inc_path}")
             for define in config.DEFINITIONS:
                 cmd.append(f"/D{define}")
             cmd.extend([str(source), f"/Fo{obj_file}"])
         else:
             cmd = ["g++", "-c"]
             cmd.extend(config.COMPILE_OPTIONS["gcc"])
+            # 添加项目根目录作为包含路径
+            cmd.append(f"-I{self.project_root}")
             for inc in config.INCLUDE_DIRS:
-                cmd.append(f"-I{self.project_root / inc}")
+                inc_path = self.project_root / inc
+                cmd.append(f"-I{inc_path}")
             for define in config.DEFINITIONS:
                 cmd.append(f"-D{define}")
             cmd.extend([str(source), "-o", str(obj_file)])
@@ -159,15 +165,32 @@ class BuildSystem:
         """生成链接命令"""
         cmd = []
         if self.compiler == "msvc":
-            cmd = ["link", "/nologo"]
-            cmd.extend(config.LINK_OPTIONS["msvc"])
-            cmd.extend([str(obj) for obj in obj_files])
-            cmd.extend([f"/OUT:{output_file}"])
+            if config.PROJECT["type"] == "executable":
+                # 可执行文件使用 link.exe
+                cmd = ["link", "/nologo", "/SUBSYSTEM:CONSOLE"]  # 添加 SUBSYSTEM 选项
+                cmd.extend(config.LINK_OPTIONS["msvc"])
+                cmd.extend([str(obj) for obj in obj_files])
+                cmd.extend([f"/OUT:{output_file}"])
+                # 添加默认库
+                cmd.extend(["kernel32.lib", "user32.lib", "gdi32.lib", "winspool.lib",
+                           "comdlg32.lib", "advapi32.lib", "shell32.lib", "ole32.lib",
+                           "oleaut32.lib", "uuid.lib", "odbc32.lib", "odbccp32.lib"])
+            else:
+                # 静态库使用 lib.exe
+                cmd = ["lib", "/nologo"]
+                cmd.extend([str(obj) for obj in obj_files])
+                cmd.extend([f"/OUT:{output_file}"])
         else:
-            cmd = ["g++"]
-            cmd.extend(config.LINK_OPTIONS["gcc"])
-            cmd.extend([str(obj) for obj in obj_files])
-            cmd.extend(["-o", str(output_file)])
+            if config.PROJECT["type"] == "executable":
+                # 可执行文件使用 g++
+                cmd = ["g++"]
+                cmd.extend(config.LINK_OPTIONS["gcc"])
+                cmd.extend([str(obj) for obj in obj_files])
+                cmd.extend(["-o", str(output_file)])
+            else:
+                # 静态库使用 ar
+                cmd = ["ar", "rcs", str(output_file)]
+                cmd.extend([str(obj) for obj in obj_files])
         return cmd
 
     def prepare_directories(self):
